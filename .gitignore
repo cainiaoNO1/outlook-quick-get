@@ -1,0 +1,23 @@
+# 敏感凭据与本地文件 - 严禁上传到 Git
+account.txt
+account.txt.*
+*.token_cache.json
+.token_cache.json
+filters.json
+config.json
+service.log
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv
+env/
+venv/
+
+# 系统临时文件
+.DS_Store
+Thumbs.db
+desktop.ini

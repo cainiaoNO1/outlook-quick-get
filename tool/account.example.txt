@@ -1,0 +1,4 @@
+# 账号配置格式说明：
+# 邮箱----密码----client_id----refresh_token
+# 示例：
+your_email@outlook.com----your_password----9e5f94bc-e8a4-4e73-b8be-63364c29d753----M.C549_...

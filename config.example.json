@@ -1,0 +1,9 @@
+{
+  "host": "0.0.0.0",
+  "port": 4000,
+  "default_client_id": "9e5f94bc-e8a4-4e73-b8be-63364c29d753",
+  "imap_fetch_cap": 30,
+  "request_timeout": 60,
+  "use_tool": true,
+  "tool_timeout": 90
+}
