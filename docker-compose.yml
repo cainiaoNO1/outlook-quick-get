@@ -1,0 +1,12 @@
+services:
+  outlook-quick-get:
+    build: .
+    image: outlook-quick-get:local
+    container_name: outlook-quick-get
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      - TZ=Asia/Shanghai
+      - DSH_MAIL_HOST=0.0.0.0
+      - PORT=4000

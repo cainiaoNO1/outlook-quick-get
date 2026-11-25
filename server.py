@@ -860,6 +860,144 @@ def save_filters(items: list[dict]) -> list[dict]:
 
 
 # ------------------------------------------------------------------ #
+# 账号库（明文持久化到 accounts.json）                                  #
+# ------------------------------------------------------------------ #
+
+ACCOUNTS_FILE = os.path.join(BASE_DIR, "accounts.json")
+_accounts_lock = threading.Lock()
+ACCOUNT_FIELDS = ("email", "password", "clientId", "refreshToken")
+
+
+def load_accounts() -> dict:
+    try:
+        with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        accounts = data.get("accounts") if isinstance(data, dict) else None
+        if not isinstance(accounts, dict):
+            return {}
+        return {k: v for k, v in accounts.items() if isinstance(v, dict)}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_accounts(accounts: dict) -> None:
+    tmp = ACCOUNTS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"accounts": accounts}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, ACCOUNTS_FILE)
+
+
+def account_key(email_addr) -> str:
+    return str(email_addr or "").strip().lower()
+
+
+def resolve_credentials(payload: dict) -> dict:
+    """用账号库补齐取件请求缺失的凭据；请求里显式给出的值优先。"""
+    resolved = dict(payload)
+    key = account_key(resolved.get("email"))
+    if "@" not in key:
+        return resolved
+    with _accounts_lock:
+        account = load_accounts().get(key)
+    if not isinstance(account, dict):
+        return resolved
+    for field in ("password", "clientId", "refreshToken"):
+        if not str(resolved.get(field) or "").strip():
+            saved = account.get(field)
+            if isinstance(saved, str) and saved:
+                resolved[field] = saved
+    return resolved
+
+
+def update_account_refresh_token(email_addr: str, refresh_token: str) -> bool:
+    """刷新成功后回写新令牌，仅当该邮箱已在账号库中。"""
+    key = account_key(email_addr)
+    if "@" not in key or not refresh_token:
+        return False
+    with _accounts_lock:
+        accounts = load_accounts()
+        account = accounts.get(key)
+        if not isinstance(account, dict):
+            return False
+        account["refreshToken"] = refresh_token
+        account["updatedAt"] = datetime.now(timezone.utc).isoformat()
+        save_accounts(accounts)
+    return True
+
+
+def api_accounts_save(payload: dict) -> dict:
+    items = payload.get("accounts")
+    if not isinstance(items, list):
+        items = []
+    saved = 0
+    errors: list[str] = []
+    with _accounts_lock:
+        accounts = load_accounts()
+        for index, item in enumerate(items):
+            label = f"第 {index + 1} 条记录"
+            if not isinstance(item, dict):
+                errors.append(f"{label}格式错误")
+                continue
+            email_addr = str(item.get("email") or "").strip()
+            if not email_addr or "@" not in email_addr:
+                errors.append(f"{label}邮箱地址无效")
+                continue
+            missing = [f for f in ACCOUNT_FIELDS if f not in item]
+            if missing:
+                errors.append(f"{email_addr}: 缺少字段 {', '.join(missing)}")
+                continue
+            accounts[account_key(email_addr)] = {
+                "email": email_addr,
+                "password": str(item.get("password") or ""),
+                "clientId": str(item.get("clientId") or "").strip(),
+                "refreshToken": str(item.get("refreshToken") or "").strip(),
+                "updatedAt": datetime.now(timezone.utc).isoformat(),
+            }
+            saved += 1
+        if saved:
+            save_accounts(accounts)
+    return {"success": True, "saved": saved, "errors": errors}
+
+
+def api_accounts_get(payload: dict) -> dict:
+    emails = payload.get("emails")
+    if not isinstance(emails, list):
+        emails = []
+    wanted: list[str] = []
+    for value in emails:
+        key = account_key(value)
+        if key and key not in wanted:
+            wanted.append(key)
+    result: dict[str, dict] = {}
+    with _accounts_lock:
+        accounts = load_accounts()
+        for key in wanted:
+            account = accounts.get(key)
+            if isinstance(account, dict):
+                item = {field: str(account.get(field) or "") for field in ACCOUNT_FIELDS}
+                item["updatedAt"] = str(account.get("updatedAt") or "")
+                result[key] = item
+    return {"success": True, "accounts": result}
+
+
+def api_accounts_delete(payload: dict) -> dict:
+    emails = payload.get("emails")
+    if not isinstance(emails, list):
+        emails = []
+    keys = {key for key in (account_key(v) for v in emails) if key}
+    with _accounts_lock:
+        accounts = load_accounts()
+        deleted = 0
+        for key in keys:
+            if key in accounts:
+                accounts.pop(key)
+                deleted += 1
+        if deleted:
+            save_accounts(accounts)
+    return {"success": True, "deleted": deleted}
+
+
+# ------------------------------------------------------------------ #
 # 桥接：直接调用桌面版 outlook_mail.js（本项目的后端接口）              #
 # ------------------------------------------------------------------ #
 
@@ -963,6 +1101,7 @@ def tool_mail_to_email(mail: dict, email_addr: str) -> dict:
 # ------------------------------------------------------------------ #
 
 def fetch_imap(payload: dict) -> dict:
+    payload = resolve_credentials(payload)
     email_addr = str(payload.get("email") or "").strip()
     client_id = str(payload.get("clientId") or CONFIG.get("default_client_id") or "").strip()
     refresh_token = str(payload.get("refreshToken") or "").strip()
@@ -1111,6 +1250,7 @@ def graph_fetch_folder(token: str, folder: str, top: int, keyword: str) -> list[
 
 
 def fetch_graph(payload: dict) -> dict:
+    payload = resolve_credentials(payload)
     email_addr = str(payload.get("email") or "").strip()
     client_id = str(payload.get("clientId") or CONFIG.get("default_client_id") or "").strip()
     refresh_token = str(payload.get("refreshToken") or "").strip()
@@ -1122,6 +1262,13 @@ def fetch_graph(payload: dict) -> dict:
     except (TypeError, ValueError):
         limit = 10
     limit = max(1, min(limit, 50))
+
+    if not email_addr or "@" not in email_addr:
+        raise TokenError("邮箱地址无效", code="INVALID_EMAIL", reason="导入数据里没有可用的邮箱地址")
+    if not client_id:
+        raise TokenError("缺少 client_id", code="MISSING_CLIENT_ID", reason="导入格式应为 邮箱----密码----clientid----刷新令牌")
+    if not refresh_token:
+        raise TokenError("缺少 refresh_token", code="MISSING_REFRESH_TOKEN", reason="导入格式应为 邮箱----密码----clientid----刷新令牌")
 
     token = get_access_token(email_addr, client_id, refresh_token, GRAPH_SCOPE, f"graph:{email_addr}:{client_id}")
 
@@ -1195,6 +1342,7 @@ def resolve_mail_host(email_addr: str) -> tuple[str, int]:
 
 
 def fetch_mail(payload: dict) -> dict:
+    payload = resolve_credentials(payload)
     email_addr = str(payload.get("email") or "").strip()
     password = str(payload.get("password") or "")
     keyword = str(payload.get("keyword") or "").strip()
@@ -1370,7 +1518,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"success": True, "filters": save_filters(body.get("filters") or [])})
             return
 
-        if path not in ("/api/fetch-imap", "/api/fetch-graph", "/api/fetch-mail", "/api/refresh-token"):
+        if path not in (
+            "/api/fetch-imap", "/api/fetch-graph", "/api/fetch-mail", "/api/refresh-token",
+            "/api/accounts/save", "/api/accounts/get", "/api/accounts/delete",
+        ):
             self._send_json({"success": False, "error": "未知接口"}, 404)
             return
 
@@ -1381,18 +1532,32 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            if path == "/api/fetch-imap":
+            if path == "/api/accounts/save":
+                result = api_accounts_save(payload)
+            elif path == "/api/accounts/get":
+                result = api_accounts_get(payload)
+            elif path == "/api/accounts/delete":
+                result = api_accounts_delete(payload)
+            elif path == "/api/fetch-imap":
                 result = fetch_imap(payload)
             elif path == "/api/fetch-graph":
                 result = fetch_graph(payload)
             elif path == "/api/fetch-mail":
                 result = fetch_mail(payload)
             else:
-                result = refresh_refresh_token(
-                    str(payload.get("email") or ""),
-                    str(payload.get("clientId") or ""),
-                    str(payload.get("refreshToken") or ""),
-                )
+                payload = resolve_credentials(payload)
+                email_addr = str(payload.get("email") or "").strip()
+                client_id = str(payload.get("clientId") or CONFIG.get("default_client_id") or "").strip()
+                refresh_token = str(payload.get("refreshToken") or "").strip()
+                if not email_addr or "@" not in email_addr:
+                    raise TokenError("邮箱地址无效", code="INVALID_EMAIL", reason="导入数据里没有可用的邮箱地址")
+                if not client_id:
+                    raise TokenError("缺少 client_id", code="MISSING_CLIENT_ID", reason="导入格式应为 邮箱----密码----clientid----刷新令牌")
+                if not refresh_token:
+                    raise TokenError("缺少 refresh_token", code="MISSING_REFRESH_TOKEN", reason="导入格式应为 邮箱----密码----clientid----刷新令牌")
+                result = refresh_refresh_token(email_addr, client_id, refresh_token)
+                if result.get("success") and result.get("refreshToken"):
+                    update_account_refresh_token(email_addr, str(result["refreshToken"]))
             self._send_json(result)
         except TokenError as exc:
             self._send_json({

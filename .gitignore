@@ -3,6 +3,8 @@ account.txt
 account.txt.*
 *.token_cache.json
 .token_cache.json
+accounts.json
+accounts.json.tmp
 filters.json
 config.json
 service.log

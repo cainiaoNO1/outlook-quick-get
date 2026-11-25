@@ -40,7 +40,7 @@ function accountStorageKey(provider = _activeProvider) {
 function saveProviderView() {
   const state = _providerStates[_activeProvider];
   state.selectedIds = new Set(Array.from(document.querySelectorAll('.account-check:checked'), cb => cb.dataset.id));
-  for (const id of ['accountSearch', 'searchKeyword', 'searchSender', 'fetchLimit', 'importTextarea']) {
+  for (const id of ['accountSearch', 'searchKeyword', 'searchSender', 'fetchLimit', 'importTextarea', 'quickFetchEmail']) {
     state.fields[id] = document.getElementById(id)?.value || '';
   }
   state.refreshReport = document.getElementById('tokenRefreshReport')?.innerHTML || '';
@@ -68,7 +68,7 @@ function applyProviderUI() {
   const limit = document.getElementById('fetchLimit');
   limit.innerHTML = (isMail ? [1, 3, 5, 10, 20] : [1, 3, 5, 10, 20, 30])
     .map(value => `<option value="${value}">${value} 封</option>`).join('');
-  for (const id of ['accountSearch', 'searchKeyword', 'searchSender', 'fetchLimit', 'importTextarea']) {
+  for (const id of ['accountSearch', 'searchKeyword', 'searchSender', 'fetchLimit', 'importTextarea', 'quickFetchEmail']) {
     document.getElementById(id).value = state.fields[id] ?? (id === 'fetchLimit' ? '5' : '');
   }
   document.querySelectorAll('.provider-tab').forEach(tab => {
@@ -620,7 +620,7 @@ function renderTokenRefreshStatus(account) {
 }
 
 function updateMailOperationButtons() {
-  for (const id of ['btnFetchSelected', 'btnFetchAll', 'btnRefreshSelected', 'btnRefreshAll', 'providerOutlook', 'providerMail']) {
+  for (const id of ['btnFetchSelected', 'btnFetchAll', 'btnQuickFetch', 'btnRefreshSelected', 'btnRefreshAll', 'providerOutlook', 'providerMail']) {
     const button = document.getElementById(id);
     if (button) button.disabled = Boolean(_mailOperation);
   }
@@ -1068,15 +1068,17 @@ function showSkeletonCards(count) {
  * 通过 Graph API 取件
  */
 async function fetchViaGraph(account, options) {
-  const response = await secureApiFetch('/api/fetch-graph', {
+  // 快捷取件只有 email 时不下发凭据字段，由服务端补全。
+  const payload = {
     email: account.email,
-    clientId: account.clientId,
-    refreshToken: account.refreshToken,
     keyword: options.keyword || '',
     limit: Math.max(1, Number.parseInt(options.limit, 10) || 1),
     sender: options.sender || '',
     filters: options.filters || [],
-  });
+  };
+  if (account.clientId) payload.clientId = account.clientId;
+  if (account.refreshToken) payload.refreshToken = account.refreshToken;
+  const response = await secureApiFetch('/api/fetch-graph', payload);
 
   const data = await parseApiResponse(response);
   if (!data.success) {
@@ -1094,15 +1096,17 @@ async function fetchViaGraph(account, options) {
  * 通过 IMAP 取件
  */
 async function fetchViaIMAP(account, options) {
-  const response = await secureApiFetch('/api/fetch-imap', {
+  // 快捷取件只有 email 时不下发凭据字段，由服务端补全。
+  const payload = {
     email: account.email,
-    clientId: account.clientId,
-    refreshToken: account.refreshToken,
     keyword: options.keyword || '',
     limit: Math.max(1, Math.min(Number.parseInt(options.limit, 10) || 1, 10)),
     sender: options.sender || '',
     filters: options.filters || [],
-  });
+  };
+  if (account.clientId) payload.clientId = account.clientId;
+  if (account.refreshToken) payload.refreshToken = account.refreshToken;
+  const response = await secureApiFetch('/api/fetch-imap', payload);
 
   const data = await parseApiResponse(response);
   if (!data.success) {
@@ -1117,14 +1121,16 @@ async function fetchViaIMAP(account, options) {
 }
 
 async function fetchViaMail(account, options = {}) {
-  const response = await secureApiFetch('/api/fetch-mail', {
+  // 快捷取件只有 email 时不下发密码，由服务端补全。
+  const payload = {
     email: account.email,
-    password: account.password,
     keyword: options.keyword || '',
     sender: options.sender || '',
     limit: Math.min(20, Math.max(1, Number.parseInt(options.limit, 10) || 1)),
     filters: options.filters || [],
-  });
+  };
+  if (account.password) payload.password = account.password;
+  const response = await secureApiFetch('/api/fetch-mail', payload);
   const data = await parseApiResponse(response);
   if (!data.success) {
     const err = new Error(data.error || data.message || 'Mail 取件失败');
@@ -1731,6 +1737,35 @@ function setButtonLoading(btn, loading, originalText = '') {
   }
 }
 
+// ==================== 账号后台保存与快捷取件 ====================
+
+async function saveImportedAccountsToBackend(accounts) {
+  if (!accounts.length) return null;
+  // 只提交约定的四个凭据字段，不保存 accessToken。
+  const payload = {
+    accounts: accounts.map(account => ({
+      email: account.email || '',
+      password: account.password || '',
+      clientId: account.clientId || '',
+      refreshToken: account.refreshToken || '',
+    })),
+  };
+  try {
+    const response = await secureApiFetch('/api/accounts/save', payload);
+    const data = await parseApiResponse(response);
+    if (!data.success) throw new Error(data.error || data.message || '后台保存失败');
+    return data;
+  } catch (error) {
+    // 后台保存失败不阻断本地导入，账号仍可正常使用。
+    showToast(`邮箱已导入本地，但后台保存失败：${simplifyErrorMessage(error.message || '请稍后重试')}`, 'warning', 6000);
+    return null;
+  }
+}
+
+function isValidQuickEmail(email) {
+  return /^[a-z0-9.!#$%&'*+\/=?^_`{}~-]+@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(email);
+}
+
 // ==================== 事件绑定 ====================
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -1833,6 +1868,8 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         saveAccounts([...existing, ...unique]);
+        // 自动把本次真正导入的账号保存到后台；失败仅提示，不影响本地导入。
+        void saveImportedAccountsToBackend(unique);
         
         // 记录新导入的ID用于高亮
         const newIds = new Set(unique.map(a => a.id));
@@ -1919,6 +1956,26 @@ document.addEventListener('DOMContentLoaded', () => {
     startFetch(accounts);
   });
 
+  // 快捷取件：仅传邮箱，凭据由服务端补全；Outlook / Mail 下通用。
+  const quickFetchEmail = document.getElementById('quickFetchEmail');
+  const btnQuickFetch = document.getElementById('btnQuickFetch');
+  const startQuickFetch = () => {
+    const email = quickFetchEmail.value.trim();
+    if (!isValidQuickEmail(email)) {
+      showToast('请输入有效的邮箱地址', 'warning');
+      quickFetchEmail.focus();
+      return;
+    }
+    return runMailOperation('fetch', () => fetchEmails([{ email }], getFetchOptions()));
+  };
+  btnQuickFetch.addEventListener('click', startQuickFetch);
+  quickFetchEmail.addEventListener('keydown', event => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      startQuickFetch();
+    }
+  });
+
   // Ctrl+Enter 快捷键提交导入
   importTextarea.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
@@ -1986,15 +2043,21 @@ function updateImportPreview() {
 /**
  * 启动取件流程
  */
+function getFetchOptions() {
+  return {
+    keyword: document.getElementById('searchKeyword').value.trim(),
+    sender: document.getElementById('searchSender').value.trim(),
+    limit: parseInt(document.getElementById('fetchLimit').value, 10) || 1,
+    // 勾选的预设过滤条件随请求下发，服务端过滤后再返回。
+    filters: getActiveFilters(),
+  };
+}
+
 function startFetch(accounts) {
   return runMailOperation('fetch', () => {
-    const keyword = document.getElementById('searchKeyword').value.trim();
-    const sender = document.getElementById('searchSender').value.trim();
-    const limit = parseInt(document.getElementById('fetchLimit').value) || 1;
     const requestedIds = new Set(accounts.map(account => account.id));
     const latest = getAccounts().filter(account => requestedIds.has(account.id));
-    // 勾选的预设过滤条件随请求下发，服务端过滤后再返回
-    return fetchEmails(latest, { keyword, sender, limit, filters: getActiveFilters() });
+    return fetchEmails(latest, getFetchOptions());
   });
 }
 

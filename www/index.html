@@ -129,6 +129,16 @@
               <select id="fetchLimit" class="input select"><option value="1">1 封</option><option value="3">3 封</option><option value="5">5 封</option><option value="10">10 封</option><option value="20">20 封</option><option value="30">30 封</option></select>
             </div>
           </div>
+          <div class="control-row quick-fetch-row">
+            <div class="input-group flex-grow">
+              <svg class="input-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="2" y="4" width="20" height="16" rx="2"></rect>
+                <path d="M22 7L12 13L2 7"></path>
+              </svg>
+              <input type="email" id="quickFetchEmail" class="input" placeholder="只填邮箱，快捷取件" autocomplete="off">
+            </div>
+            <button type="button" class="btn btn-accent" id="btnQuickFetch">快捷取件</button>
+          </div>
           <div class="control-row filter-row">
             <button type="button" class="btn btn-ghost btn-small" id="btnToggleFilters">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
