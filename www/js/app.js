@@ -897,6 +897,27 @@ async function fetchEmails(accounts, options = {}) {
     const emailShort = account.email.split('@')[0];
     const accountLabel = `[${i + 1}/${accounts.length}] ${emailShort}`;
 
+    // 任一协议先成功就先把邮件渲染出来，不让慢的那个协议拖住整批结果
+    const appendResultImmediately = (result) => {
+      if (!result || !Array.isArray(result.emails) || !result.emails.length) return;
+      result.emails.forEach(email => {
+        email._account = account.email;
+        email._accountIndex = i;
+      });
+      visibleEmails.push(...result.emails);
+      const mergedNow = deduplicateEmails(visibleEmails);
+      mergedNow.sort((a, b) => {
+        const accountDelta = (a._accountIndex ?? 0) - (b._accountIndex ?? 0);
+        if (accountDelta !== 0) return accountDelta;
+        return new Date(b.date) - new Date(a.date);
+      });
+      renderEmailList(mergedNow, {
+        accounts,
+        completedAccounts: i,
+        isFetching: true,
+      });
+    };
+
     const promises = [];
 
     if (useMail) {
@@ -912,7 +933,7 @@ async function fetchEmails(accounts, options = {}) {
           updateProgress(Math.round((completedSteps / totalSteps) * 95), `${accountLabel} — Mail ❌`);
           return { success: false, emails: [], protocol: 'mail', _error: normalizeFetchError(account.email, 'mail', err) };
         }
-      })());
+      })().then(appendResultImmediately));
     }
 
     // 双协议并行请求，每个完成时更新进度
@@ -944,7 +965,7 @@ async function fetchEmails(accounts, options = {}) {
               _error: normalizeFetchError(account.email, 'graph', err),
             };
           }
-        })()
+        })().then(appendResultImmediately)
       );
     }
 
@@ -976,7 +997,7 @@ async function fetchEmails(accounts, options = {}) {
               _error: normalizeFetchError(account.email, 'imap', err),
             };
           }
-        })()
+        })().then(appendResultImmediately)
       );
     }
 
@@ -991,16 +1012,7 @@ async function fetchEmails(accounts, options = {}) {
       failedAccountErrors.push(...accountErrors);
     }
 
-    // 收集邮件并标记来源账号
-    results.forEach(result => {
-      if (result.emails && result.emails.length > 0) {
-        result.emails.forEach(email => {
-          email._account = account.email;
-          email._accountIndex = i;
-        });
-        visibleEmails.push(...result.emails);
-      }
-    });
+    // 邮件已在各协议成功时即时收集并渲染，这里只做最终去重。
 
     visibleEmails = deduplicateEmails(visibleEmails);
     visibleEmails.sort((a, b) => {
@@ -1078,7 +1090,7 @@ async function fetchViaGraph(account, options) {
   };
   if (account.clientId) payload.clientId = account.clientId;
   if (account.refreshToken) payload.refreshToken = account.refreshToken;
-  const response = await secureApiFetch('/api/fetch-graph', payload);
+  const response = await secureApiFetch('/api/fetch-graph', payload, 0, 25000);
 
   const data = await parseApiResponse(response);
   if (!data.success) {
@@ -1106,7 +1118,7 @@ async function fetchViaIMAP(account, options) {
   };
   if (account.clientId) payload.clientId = account.clientId;
   if (account.refreshToken) payload.refreshToken = account.refreshToken;
-  const response = await secureApiFetch('/api/fetch-imap', payload);
+  const response = await secureApiFetch('/api/fetch-imap', payload, 0, 60000);
 
   const data = await parseApiResponse(response);
   if (!data.success) {
@@ -1130,7 +1142,7 @@ async function fetchViaMail(account, options = {}) {
     filters: options.filters || [],
   };
   if (account.password) payload.password = account.password;
-  const response = await secureApiFetch('/api/fetch-mail', payload);
+  const response = await secureApiFetch('/api/fetch-mail', payload, 0, 45000);
   const data = await parseApiResponse(response);
   if (!data.success) {
     const err = new Error(data.error || data.message || 'Mail 取件失败');
@@ -1148,29 +1160,40 @@ async function fetchViaMail(account, options = {}) {
   return { ...data, protocol: 'mail', emails: (data.emails || []).map(email => ({ ...email, protocol: 'mail' })) };
 }
 
-async function secureApiFetch(url, payload, retryCount = 0) {
+async function secureApiFetch(url, payload, retryCount = 0, timeoutMs = 0) {
   // 非安全上下文（例如用 http://内网IP 直接访问）拿不到 crypto.subtle，
   // 此时退化为明文 JSON；通过 https / localhost 访问时仍使用 AES-GCM + HMAC 加密信封。
   const envelope = window.crypto?.subtle ? await createSecureEnvelope(payload) : { ...payload };
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(envelope),
-  });
-
-  if ((response.status === 401 || response.status === 403) && retryCount < SECURITY_RETRY_LIMIT) {
-    // 业务认证失败不能靠重建安全封包修复，重试反而会重复登录邮箱。
-    // 使用 clone 检查错误，保留原始响应供取件流程读取。
-    const failure = await response.clone().json().catch(() => null);
-    const securityFailure = failure?.code === 'SECURITY_ENVELOPE_INVALID'
-      || (!failure?.code && /安全会话|请求签名|\bnonce\b|加密请求体|请求(?:已)?过期/i.test([failure?.error, failure?.message].filter(value => typeof value === 'string').join(' ')));
-    if (securityFailure) {
-      _apiSecuritySession = null;
-      return secureApiFetch(url, payload, retryCount + 1);
-    }
+  // 取件请求必须有超时，否则某个协议挂起会让整个账号一直卡在进度条上。
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  let timer = null;
+  if (controller && timeoutMs > 0) {
+    timer = setTimeout(() => controller.abort(), timeoutMs);
   }
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(envelope),
+      signal: controller?.signal,
+    });
 
-  return response;
+    if ((response.status === 401 || response.status === 403) && retryCount < SECURITY_RETRY_LIMIT) {
+      // 业务认证失败不能靠重建安全封包修复，重试反而会重复登录邮箱。
+      // 使用 clone 检查错误，保留原始响应供取件流程读取。
+      const failure = await response.clone().json().catch(() => null);
+      const securityFailure = failure?.code === 'SECURITY_ENVELOPE_INVALID'
+        || (!failure?.code && /安全会话|请求签名|\bnonce\b|加密请求体|请求(?:已)?过期/i.test([failure?.error, failure?.message].filter(value => typeof value === 'string').join(' ')));
+      if (securityFailure) {
+        _apiSecuritySession = null;
+        return secureApiFetch(url, payload, retryCount + 1, timeoutMs);
+      }
+    }
+
+    return response;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function getApiSecuritySession() {
@@ -1288,6 +1311,7 @@ function simplifyErrorMessage(message) {
       ? 'IMAP 登录失败，请检查账号密码，并确认该邮箱已开启 IMAP'
       : 'IMAP 认证失败，请检查账号权限和令牌 scope';
   }
+  if (/abort|aborted/i.test(text)) return '该协议取件超时已跳过，不影响其它协议结果';
   if (/timeout|ETIMEDOUT|ESOCKETTIMEDOUT/i.test(text)) return '连接超时，请稍后重试或降低取件数量';
   if (/Failed to fetch|NetworkError/i.test(text)) return '网络请求失败，请检查服务器网络';
   if (/Graph API 错误: ErrorInvalidUser|MailboxNotEnabledForRESTAPI/i.test(text)) return 'Graph 无法访问该邮箱，请检查账号类型或权限';
